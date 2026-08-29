@@ -1,7 +1,7 @@
 """
 FastAPI Serving Layer for Real-Time Fraud Detection Inference.
-Provides /predict, /predict/async, /predict/batch, /health, /models, and /queue/stats endpoints.
-Integrated with DynamicBatcher for sub-millisecond request queuing and adaptive micro-batching.
+Provides /predict, /predict/async, /predict/batch, /predict/rollout, /health, /models, /queue/stats, and /rollout/stats.
+Integrates Dynamic Batcher and RolloutRouter for A/B testing and Shadow deployments.
 """
 import time
 import logging
@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from src.serving.model_loader import ModelRegistryLoader
 from src.queue.async_queue import DynamicBatcher
+from src.rollout.router import RolloutRouter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -20,10 +21,11 @@ logger = logging.getLogger(__name__)
 START_TIME = time.time()
 loader: Optional[ModelRegistryLoader] = None
 batcher: Optional[DynamicBatcher] = None
+router: Optional[RolloutRouter] = None
 
 
 def run_inference_batch(features_list: List[Dict[str, float]], model_version: str) -> Dict[str, Any]:
-    """Helper function to invoke model predict for batcher worker thread."""
+    """Helper function to invoke model predict for batcher/router worker thread."""
     global loader
     if loader is None:
         loader = ModelRegistryLoader(model_dir="models", data_dir="data/processed")
@@ -32,8 +34,8 @@ def run_inference_batch(features_list: List[Dict[str, float]], model_version: st
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle startup and shutdown handler for FastAPI app and Async Queue."""
-    global loader, batcher
+    """Lifecycle startup and shutdown handler."""
+    global loader, batcher, router
     logger.info("Initializing FastAPI Serving Layer & Pre-loading Model Registry...")
     loader = ModelRegistryLoader(model_dir="models", data_dir="data/processed")
     
@@ -45,7 +47,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Model pre-warm warning: {e}")
 
-    # Initialize and start Dynamic Batcher
+    # Initialize Dynamic Batcher
     batcher = DynamicBatcher(
         inference_fn=run_inference_batch,
         max_batch_size=64,
@@ -53,18 +55,25 @@ async def lifespan(app: FastAPI):
         model_version="champion"
     )
     await batcher.start()
-    logger.info("Dynamic Batching Engine active!")
+
+    # Initialize Rollout Router
+    router = RolloutRouter(
+        predict_fn=run_inference_batch,
+        champion_version="champion",
+        challenger_version="baseline"
+    )
+    logger.info("Rollout Router & Dynamic Batcher active!")
 
     yield
 
-    logger.info("Shutting down Dynamic Batcher & FastAPI Service...")
+    logger.info("Shutting down service...")
     if batcher:
         await batcher.stop()
 
 
 app = FastAPI(
     title="ML Fraud Detection Inference Platform",
-    description="Production-Grade ML Inference Service with Async Queues & Dynamic Batching",
+    description="Production-Grade ML Inference Service with A/B Testing & Shadow Deployments",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -106,20 +115,6 @@ class TransactionItem(BaseModel):
     V28: float = Field(default=0.0)
     Amount: float = Field(default=0.0, description="Transaction amount")
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "Time": 412.0,
-                "V1": -1.35, "V2": 1.2, "V3": -0.8, "V4": 2.5, "V5": -0.5,
-                "V6": -0.2, "V7": -1.1, "V8": 0.4, "V9": -0.6, "V10": 3.0,
-                "V11": 2.1, "V12": -1.5, "V13": 0.1, "V14": -3.5, "V15": 0.2,
-                "V16": 0.8, "V17": -2.0, "V18": -0.3, "V19": 0.5, "V20": 0.1,
-                "V21": 0.25, "V22": -0.1, "V23": 0.05, "V24": 0.3, "V25": -0.2,
-                "V26": 0.15, "V27": 0.08, "V28": -0.02,
-                "Amount": 149.99
-            }
-        }
-
 
 class SinglePredictionRequest(BaseModel):
     transaction: TransactionItem
@@ -133,6 +128,13 @@ class BatchPredictionRequest(BaseModel):
     threshold: Optional[float] = Field(default=None, description="Custom decision threshold override")
 
 
+class RolloutPredictionRequest(BaseModel):
+    transactions: List[TransactionItem]
+    mode: str = Field(default="ab_test", description="Rollout mode: 'ab_test' or 'shadow'")
+    challenger_ratio: float = Field(default=0.20, description="Percentage of traffic routed to challenger in A/B test (0.0 to 1.0)")
+    request_id: Optional[str] = Field(default=None, description="Optional request ID for deterministic hash routing")
+
+
 class PredictionResult(BaseModel):
     is_fraud: int = Field(description="Binary classification (1=fraud, 0=genuine)")
     fraud_probability: float = Field(description="Model probability score between 0.0 and 1.0")
@@ -141,6 +143,15 @@ class PredictionResult(BaseModel):
 class PredictionResponse(BaseModel):
     predictions: List[PredictionResult]
     model_version: str
+    threshold_used: float
+    latency_ms: float
+
+
+class RolloutPredictionResponse(BaseModel):
+    predictions: List[PredictionResult]
+    model_version: str
+    routing_mode: str
+    selected_variant: Optional[str]
     threshold_used: float
     latency_ms: float
 
@@ -166,87 +177,68 @@ class HealthResponse(BaseModel):
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 def health_check():
-    """Health and readiness check endpoint."""
+    """Health check endpoint."""
     global loader
     if loader is None:
         loader = ModelRegistryLoader(model_dir="models", data_dir="data/processed")
 
-    loaded_keys = list(loader.loaded_models.keys())
-    uptime = time.time() - START_TIME
-
     return HealthResponse(
         status="ok",
-        uptime_seconds=round(uptime, 2),
-        loaded_models=loaded_keys,
+        uptime_seconds=round(time.time() - START_TIME, 2),
+        loaded_models=list(loader.loaded_models.keys()),
         registry_connected=True
     )
 
 
 @app.post("/predict", response_model=PredictionResponse, tags=["Inference"])
 def predict_single(request: SinglePredictionRequest):
-    """Sync single transaction real-time fraud prediction endpoint."""
+    """Sync single transaction prediction endpoint."""
     global loader
     if loader is None:
         loader = ModelRegistryLoader(model_dir="models", data_dir="data/processed")
 
-    try:
-        data_dict = request.transaction.model_dump()
-        res = loader.predict(
-            features=data_dict,
-            version_or_alias=request.model_version or "champion",
-            custom_threshold=request.threshold
-        )
+    data_dict = request.transaction.model_dump()
+    res = loader.predict(
+        features=data_dict,
+        version_or_alias=request.model_version or "champion",
+        custom_threshold=request.threshold
+    )
 
-        results = [
-            PredictionResult(is_fraud=pred, fraud_probability=prob)
-            for pred, prob in zip(res["predictions"], res["probabilities"])
-        ]
+    results = [
+        PredictionResult(is_fraud=pred, fraud_probability=prob)
+        for pred, prob in zip(res["predictions"], res["probabilities"])
+    ]
 
-        return PredictionResponse(
-            predictions=results,
-            model_version=res["model_version"],
-            threshold_used=res["threshold_used"],
-            latency_ms=round(res["latency_ms"], 3)
-        )
-    except Exception as e:
-        logger.error(f"Inference error in /predict: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    return PredictionResponse(
+        predictions=results,
+        model_version=res["model_version"],
+        threshold_used=res["threshold_used"],
+        latency_ms=round(res["latency_ms"], 3)
+    )
 
 
 @app.post("/predict/async", response_model=AsyncPredictionResponse, tags=["Inference"])
 async def predict_async(request: SinglePredictionRequest):
-    """
-    Decoupled Async Single Transaction Fraud Prediction.
-    Enqueues incoming item into Dynamic Batcher micro-batch queue.
-    """
+    """Decoupled async prediction endpoint."""
     global batcher
     if batcher is None:
-        batcher = DynamicBatcher(
-            inference_fn=run_inference_batch,
-            max_batch_size=64,
-            max_latency_ms=10.0,
-            model_version=request.model_version or "champion"
-        )
+        batcher = DynamicBatcher(inference_fn=run_inference_batch, max_batch_size=64, max_latency_ms=10.0)
         await batcher.start()
 
-    try:
-        data_dict = request.transaction.model_dump()
-        result = await batcher.enqueue(data_dict, model_version=request.model_version or "champion")
-        return AsyncPredictionResponse(
-            is_fraud=result["is_fraud"],
-            fraud_probability=round(result["fraud_probability"], 4),
-            model_version=result["model_version"],
-            threshold_used=result["threshold_used"],
-            batch_size=result["batch_size"]
-        )
-    except Exception as e:
-        logger.error(f"Async inference error in /predict/async: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    data_dict = request.transaction.model_dump()
+    result = await batcher.enqueue(data_dict, model_version=request.model_version or "champion")
+    return AsyncPredictionResponse(
+        is_fraud=result["is_fraud"],
+        fraud_probability=round(result["fraud_probability"], 4),
+        model_version=result["model_version"],
+        threshold_used=result["threshold_used"],
+        batch_size=result["batch_size"]
+    )
 
 
 @app.post("/predict/batch", response_model=PredictionResponse, tags=["Inference"])
 def predict_batch(request: BatchPredictionRequest):
-    """Batch transactions fraud prediction endpoint."""
+    """Batch transactions prediction endpoint."""
     global loader
     if loader is None:
         loader = ModelRegistryLoader(model_dir="models", data_dir="data/processed")
@@ -254,33 +246,82 @@ def predict_batch(request: BatchPredictionRequest):
     if not request.transactions:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transactions list cannot be empty.")
 
-    try:
-        data_list = [t.model_dump() for t in request.transactions]
-        res = loader.predict(
-            features=data_list,
-            version_or_alias=request.model_version or "champion",
-            custom_threshold=request.threshold
-        )
+    data_list = [t.model_dump() for t in request.transactions]
+    res = loader.predict(
+        features=data_list,
+        version_or_alias=request.model_version or "champion",
+        custom_threshold=request.threshold
+    )
 
-        results = [
-            PredictionResult(is_fraud=pred, fraud_probability=prob)
-            for pred, prob in zip(res["predictions"], res["probabilities"])
-        ]
+    results = [
+        PredictionResult(is_fraud=pred, fraud_probability=prob)
+        for pred, prob in zip(res["predictions"], res["probabilities"])
+    ]
 
-        return PredictionResponse(
-            predictions=results,
-            model_version=res["model_version"],
-            threshold_used=res["threshold_used"],
-            latency_ms=round(res["latency_ms"], 3)
+    return PredictionResponse(
+        predictions=results,
+        model_version=res["model_version"],
+        threshold_used=res["threshold_used"],
+        latency_ms=round(res["latency_ms"], 3)
+    )
+
+
+@app.post("/predict/rollout", response_model=RolloutPredictionResponse, tags=["Rollout"])
+def predict_rollout(request: RolloutPredictionRequest):
+    """
+    Safe Rollout Endpoint for A/B Testing & Shadow Deployment.
+    Supports 'ab_test' (traffic split) and 'shadow' (silent secondary prediction divergence tracking).
+    """
+    global router
+    if router is None:
+        router = RolloutRouter(predict_fn=run_inference_batch)
+
+    if not request.transactions:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transactions list cannot be empty.")
+
+    t0 = time.time()
+    data_list = [t.model_dump() for t in request.transactions]
+
+    if request.mode.lower() == "shadow":
+        res = router.route_shadow(data_list)
+        selected_variant = "champion_primary_with_shadow_challenger"
+    else:
+        res = router.route_ab_test(
+            data_list,
+            challenger_ratio=request.challenger_ratio,
+            request_id=request.request_id
         )
-    except Exception as e:
-        logger.error(f"Inference error in /predict/batch: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+        selected_variant = res.get("selected_variant", "champion")
+
+    results = [
+        PredictionResult(is_fraud=pred, fraud_probability=prob)
+        for pred, prob in zip(res["predictions"], res["probabilities"])
+    ]
+
+    latency_ms = (time.time() - t0) * 1000.0
+
+    return RolloutPredictionResponse(
+        predictions=results,
+        model_version=res.get("model_version", "champion"),
+        routing_mode=request.mode,
+        selected_variant=selected_variant,
+        threshold_used=res.get("threshold_used", 0.5),
+        latency_ms=round(latency_ms, 3)
+    )
+
+
+@app.get("/rollout/stats", tags=["Rollout"])
+def get_rollout_stats():
+    """Return live A/B traffic split ratio and shadow divergence metrics."""
+    global router
+    if router is None:
+        router = RolloutRouter(predict_fn=run_inference_batch)
+    return router.get_rollout_stats()
 
 
 @app.get("/queue/stats", tags=["Monitoring"])
 def get_queue_stats():
-    """Return live Dynamic Batcher and queue statistics."""
+    """Return live Dynamic Batcher statistics."""
     global batcher
     if batcher is None:
         return {"status": "inactive"}
