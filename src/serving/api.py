@@ -1,19 +1,30 @@
 """
 FastAPI Serving Layer for Real-Time Fraud Detection Inference.
-Provides /predict, /predict/async, /predict/batch, /predict/rollout, /health, /models, /queue/stats, and /rollout/stats.
-Integrates Dynamic Batcher and RolloutRouter for A/B testing and Shadow deployments.
+Includes Prometheus Observability (/metrics), Statistical Drift Monitoring (/monitoring/drift),
+Dynamic Batching, and Safe Rollout Router.
 """
 import time
 import logging
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Request, Response, Query, status
 from pydantic import BaseModel, Field
+from prometheus_client import make_asgi_app
 
 from src.serving.model_loader import ModelRegistryLoader
 from src.queue.async_queue import DynamicBatcher
 from src.rollout.router import RolloutRouter
+from src.monitoring.drift_detector import DriftDetector
+from src.monitoring.prometheus_metrics import (
+    LATENCY_HISTOGRAM,
+    REQUEST_COUNTER,
+    ERROR_COUNTER,
+    PREDICTION_COUNTER,
+    QUEUE_DEPTH_GAUGE,
+    BATCH_SIZE_AVG_GAUGE,
+    update_drift_prometheus_metrics
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -22,23 +33,34 @@ START_TIME = time.time()
 loader: Optional[ModelRegistryLoader] = None
 batcher: Optional[DynamicBatcher] = None
 router: Optional[RolloutRouter] = None
+drift_detector: Optional[DriftDetector] = None
 
 
 def run_inference_batch(features_list: List[Dict[str, float]], model_version: str) -> Dict[str, Any]:
     """Helper function to invoke model predict for batcher/router worker thread."""
-    global loader
+    global loader, drift_detector
     if loader is None:
         loader = ModelRegistryLoader(model_dir="models", data_dir="data/processed")
-    return loader.predict(features=features_list, version_or_alias=model_version)
+    if drift_detector:
+        drift_detector.add_production_batch(features_list)
+
+    res = loader.predict(features=features_list, version_or_alias=model_version)
+
+    # Track Prometheus prediction counters
+    for label in res.get("predictions", []):
+        PREDICTION_COUNTER.labels(model_version=model_version, prediction_label=str(label)).inc()
+
+    return res
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle startup and shutdown handler."""
-    global loader, batcher, router
-    logger.info("Initializing FastAPI Serving Layer & Pre-loading Model Registry...")
+    global loader, batcher, router, drift_detector
+    logger.info("Initializing FastAPI Serving Layer & Observability Stack...")
     loader = ModelRegistryLoader(model_dir="models", data_dir="data/processed")
-    
+    drift_detector = DriftDetector(data_dir="data/processed")
+
     # Pre-warm models
     try:
         loader.get_model("champion")
@@ -62,7 +84,7 @@ async def lifespan(app: FastAPI):
         champion_version="champion",
         challenger_version="baseline"
     )
-    logger.info("Rollout Router & Dynamic Batcher active!")
+    logger.info("Observability, Dynamic Batcher & Rollout Router Active!")
 
     yield
 
@@ -73,10 +95,37 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ML Fraud Detection Inference Platform",
-    description="Production-Grade ML Inference Service with A/B Testing & Shadow Deployments",
+    description="Production-Grade ML Inference Service with Prometheus & Data Drift Monitoring",
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Mount Prometheus /metrics endpoint
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
+
+
+# HTTP Request Metrics Middleware
+@app.middleware("http")
+async def prometheus_middleware(request: Request, call_next):
+    start_time = time.time()
+    endpoint = request.url.path
+    method = request.method
+
+    try:
+        response: Response = await call_next(request)
+        duration = time.time() - start_time
+        status_code = str(response.status_code)
+
+        if not endpoint.startswith("/metrics"):
+            LATENCY_HISTOGRAM.labels(endpoint=endpoint, method=method, status_code=status_code).observe(duration)
+            REQUEST_COUNTER.labels(endpoint=endpoint, method=method, status_code=status_code).inc()
+
+        return response
+    except Exception as e:
+        duration = time.time() - start_time
+        ERROR_COUNTER.labels(endpoint=endpoint, error_type=type(e).__name__).inc()
+        raise e
 
 
 # ==========================================
@@ -84,7 +133,7 @@ app = FastAPI(
 # ==========================================
 
 class TransactionItem(BaseModel):
-    Time: float = Field(default=0.0, description="Seconds elapsed since first transaction")
+    Time: float = Field(default=0.0)
     V1: float = Field(default=0.0)
     V2: float = Field(default=0.0)
     V3: float = Field(default=0.0)
@@ -113,31 +162,31 @@ class TransactionItem(BaseModel):
     V26: float = Field(default=0.0)
     V27: float = Field(default=0.0)
     V28: float = Field(default=0.0)
-    Amount: float = Field(default=0.0, description="Transaction amount")
+    Amount: float = Field(default=0.0)
 
 
 class SinglePredictionRequest(BaseModel):
     transaction: TransactionItem
-    model_version: Optional[str] = Field(default="champion", description="Model version or alias")
-    threshold: Optional[float] = Field(default=None, description="Custom decision threshold override")
+    model_version: Optional[str] = Field(default="champion")
+    threshold: Optional[float] = Field(default=None)
 
 
 class BatchPredictionRequest(BaseModel):
     transactions: List[TransactionItem]
-    model_version: Optional[str] = Field(default="champion", description="Model version or alias")
-    threshold: Optional[float] = Field(default=None, description="Custom decision threshold override")
+    model_version: Optional[str] = Field(default="champion")
+    threshold: Optional[float] = Field(default=None)
 
 
 class RolloutPredictionRequest(BaseModel):
     transactions: List[TransactionItem]
-    mode: str = Field(default="ab_test", description="Rollout mode: 'ab_test' or 'shadow'")
-    challenger_ratio: float = Field(default=0.20, description="Percentage of traffic routed to challenger in A/B test (0.0 to 1.0)")
-    request_id: Optional[str] = Field(default=None, description="Optional request ID for deterministic hash routing")
+    mode: str = Field(default="ab_test")
+    challenger_ratio: float = Field(default=0.20)
+    request_id: Optional[str] = Field(default=None)
 
 
 class PredictionResult(BaseModel):
-    is_fraud: int = Field(description="Binary classification (1=fraud, 0=genuine)")
-    fraud_probability: float = Field(description="Model probability score between 0.0 and 1.0")
+    is_fraud: int
+    fraud_probability: float
 
 
 class PredictionResponse(BaseModel):
@@ -193,16 +242,22 @@ def health_check():
 @app.post("/predict", response_model=PredictionResponse, tags=["Inference"])
 def predict_single(request: SinglePredictionRequest):
     """Sync single transaction prediction endpoint."""
-    global loader
+    global loader, drift_detector
     if loader is None:
         loader = ModelRegistryLoader(model_dir="models", data_dir="data/processed")
 
     data_dict = request.transaction.model_dump()
+    if drift_detector:
+        drift_detector.add_production_sample(data_dict)
+
     res = loader.predict(
         features=data_dict,
         version_or_alias=request.model_version or "champion",
         custom_threshold=request.threshold
     )
+
+    for label in res.get("predictions", []):
+        PREDICTION_COUNTER.labels(model_version=request.model_version or "champion", prediction_label=str(label)).inc()
 
     results = [
         PredictionResult(is_fraud=pred, fraud_probability=prob)
@@ -239,7 +294,7 @@ async def predict_async(request: SinglePredictionRequest):
 @app.post("/predict/batch", response_model=PredictionResponse, tags=["Inference"])
 def predict_batch(request: BatchPredictionRequest):
     """Batch transactions prediction endpoint."""
-    global loader
+    global loader, drift_detector
     if loader is None:
         loader = ModelRegistryLoader(model_dir="models", data_dir="data/processed")
 
@@ -247,11 +302,17 @@ def predict_batch(request: BatchPredictionRequest):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transactions list cannot be empty.")
 
     data_list = [t.model_dump() for t in request.transactions]
+    if drift_detector:
+        drift_detector.add_production_batch(data_list)
+
     res = loader.predict(
         features=data_list,
         version_or_alias=request.model_version or "champion",
         custom_threshold=request.threshold
     )
+
+    for label in res.get("predictions", []):
+        PREDICTION_COUNTER.labels(model_version=request.model_version or "champion", prediction_label=str(label)).inc()
 
     results = [
         PredictionResult(is_fraud=pred, fraud_probability=prob)
@@ -268,10 +329,7 @@ def predict_batch(request: BatchPredictionRequest):
 
 @app.post("/predict/rollout", response_model=RolloutPredictionResponse, tags=["Rollout"])
 def predict_rollout(request: RolloutPredictionRequest):
-    """
-    Safe Rollout Endpoint for A/B Testing & Shadow Deployment.
-    Supports 'ab_test' (traffic split) and 'shadow' (silent secondary prediction divergence tracking).
-    """
+    """Safe Rollout Endpoint for A/B Testing & Shadow Deployment."""
     global router
     if router is None:
         router = RolloutRouter(predict_fn=run_inference_batch)
@@ -286,11 +344,7 @@ def predict_rollout(request: RolloutPredictionRequest):
         res = router.route_shadow(data_list)
         selected_variant = "champion_primary_with_shadow_challenger"
     else:
-        res = router.route_ab_test(
-            data_list,
-            challenger_ratio=request.challenger_ratio,
-            request_id=request.request_id
-        )
+        res = router.route_ab_test(data_list, challenger_ratio=request.challenger_ratio, request_id=request.request_id)
         selected_variant = res.get("selected_variant", "champion")
 
     results = [
@@ -310,6 +364,21 @@ def predict_rollout(request: RolloutPredictionRequest):
     )
 
 
+@app.get("/monitoring/drift", tags=["Monitoring"])
+def get_drift_report():
+    """
+    Compute and return statistical data drift report (KS p-values & PSI scores).
+    Also syncs latest metrics with Prometheus gauges.
+    """
+    global drift_detector
+    if drift_detector is None:
+        drift_detector = DriftDetector(data_dir="data/processed")
+
+    report = drift_detector.compute_drift_report()
+    update_drift_prometheus_metrics(report)
+    return report
+
+
 @app.get("/rollout/stats", tags=["Rollout"])
 def get_rollout_stats():
     """Return live A/B traffic split ratio and shadow divergence metrics."""
@@ -325,7 +394,10 @@ def get_queue_stats():
     global batcher
     if batcher is None:
         return {"status": "inactive"}
-    return batcher.get_stats()
+    stats_dict = batcher.get_stats()
+    QUEUE_DEPTH_GAUGE.set(stats_dict.get("queue_depth", 0))
+    BATCH_SIZE_AVG_GAUGE.set(stats_dict.get("avg_batch_size", 0.0))
+    return stats_dict
 
 
 @app.get("/models", tags=["Registry"])
