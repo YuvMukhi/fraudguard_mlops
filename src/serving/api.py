@@ -1,8 +1,9 @@
 """
 FastAPI Serving Layer for Real-Time Fraud Detection Inference.
 Includes Prometheus Observability (/metrics), Statistical Drift Monitoring (/monitoring/drift),
-Dynamic Batching, and Safe Rollout Router.
+Optimization & Quantization Benchmarks (/optimization/benchmark), Dynamic Batching, and Safe Rollout Router.
 """
+import os
 import time
 import logging
 from typing import List, Dict, Any, Optional
@@ -11,11 +12,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response, Query, status
 from pydantic import BaseModel, Field
 from prometheus_client import make_asgi_app
+import pandas as pd
 
 from src.serving.model_loader import ModelRegistryLoader
 from src.queue.async_queue import DynamicBatcher
 from src.rollout.router import RolloutRouter
 from src.monitoring.drift_detector import DriftDetector
+from src.optimization.quantizer import ModelOptimizer
+from src.models.heavy import HeavyModel
 from src.monitoring.prometheus_metrics import (
     LATENCY_HISTOGRAM,
     REQUEST_COUNTER,
@@ -34,6 +38,7 @@ loader: Optional[ModelRegistryLoader] = None
 batcher: Optional[DynamicBatcher] = None
 router: Optional[RolloutRouter] = None
 drift_detector: Optional[DriftDetector] = None
+optimizer: Optional[ModelOptimizer] = None
 
 
 def run_inference_batch(features_list: List[Dict[str, float]], model_version: str) -> Dict[str, Any]:
@@ -46,7 +51,6 @@ def run_inference_batch(features_list: List[Dict[str, float]], model_version: st
 
     res = loader.predict(features=features_list, version_or_alias=model_version)
 
-    # Track Prometheus prediction counters
     for label in res.get("predictions", []):
         PREDICTION_COUNTER.labels(model_version=model_version, prediction_label=str(label)).inc()
 
@@ -56,10 +60,11 @@ def run_inference_batch(features_list: List[Dict[str, float]], model_version: st
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle startup and shutdown handler."""
-    global loader, batcher, router, drift_detector
-    logger.info("Initializing FastAPI Serving Layer & Observability Stack...")
+    global loader, batcher, router, drift_detector, optimizer
+    logger.info("Initializing FastAPI Serving Layer & Optimization Stack...")
     loader = ModelRegistryLoader(model_dir="models", data_dir="data/processed")
     drift_detector = DriftDetector(data_dir="data/processed")
+    optimizer = ModelOptimizer(model_dir="models")
 
     # Pre-warm models
     try:
@@ -84,7 +89,7 @@ async def lifespan(app: FastAPI):
         champion_version="champion",
         challenger_version="baseline"
     )
-    logger.info("Observability, Dynamic Batcher & Rollout Router Active!")
+    logger.info("Observability, Quantization Optimizer, Dynamic Batcher & Rollout Router Active!")
 
     yield
 
@@ -95,7 +100,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ML Fraud Detection Inference Platform",
-    description="Production-Grade ML Inference Service with Prometheus & Data Drift Monitoring",
+    description="Production-Grade ML Inference Service with INT8 Model Quantization & Benchmarking",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -364,12 +369,50 @@ def predict_rollout(request: RolloutPredictionRequest):
     )
 
 
+@app.get("/optimization/benchmark", tags=["Optimization"])
+def benchmark_optimization():
+    """
+    Run latency (P50, P95, P99) and accuracy benchmarking comparing FP32 vs INT8 Dynamic Quantization.
+    Validates model error tolerance and returns fallback decision status.
+    """
+    global loader, optimizer
+    if loader is None:
+        loader = ModelRegistryLoader(model_dir="models", data_dir="data/processed")
+    if optimizer is None:
+        optimizer = ModelOptimizer(model_dir="models")
+
+    # Load heavy model instance
+    model_obj, _, _ = loader.get_model("champion")
+    if not isinstance(model_obj, HeavyModel):
+        heavy_path = os.path.join("models", "heavy_model.pt")
+        if os.path.exists(heavy_path):
+            model_obj = HeavyModel.load(heavy_path)
+        else:
+            model_obj = HeavyModel(input_dim=30)
+            model_obj.fit(
+                pd.DataFrame(np.random.randn(50, 30)),
+                pd.Series([0]*45 + [1]*5),
+                pd.DataFrame(np.random.randn(20, 30)),
+                pd.Series([0]*18 + [1]*2)
+            )
+
+    # Load test dataset sample
+    test_path = os.path.join("data/processed", "test.parquet")
+    if not os.path.exists(test_path):
+        test_path = os.path.join("data/processed", "test.csv")
+
+    if os.path.exists(test_path):
+        test_df = pd.read_parquet(test_path) if test_path.endswith(".parquet") else pd.read_csv(test_path)
+    else:
+        test_df = pd.DataFrame(np.random.randn(100, 31), columns=["Time"] + [f"V{i}" for i in range(1, 29)] + ["Amount", "Class"])
+
+    results = optimizer.benchmark_models(heavy_model=model_obj, test_df=test_df, n_iterations=50)
+    return results
+
+
 @app.get("/monitoring/drift", tags=["Monitoring"])
 def get_drift_report():
-    """
-    Compute and return statistical data drift report (KS p-values & PSI scores).
-    Also syncs latest metrics with Prometheus gauges.
-    """
+    """Compute and return statistical data drift report (KS p-values & PSI scores)."""
     global drift_detector
     if drift_detector is None:
         drift_detector = DriftDetector(data_dir="data/processed")
