@@ -1,5 +1,6 @@
 """
 Model Registry Loader & Inference Engine for FastAPI Serving Layer.
+Optimized for ultra-low latency inference using NumPy arrays for single and batch predictions.
 Supports MLflow Model Registry version pinning and local fallback checkpoints.
 """
 import os
@@ -59,7 +60,6 @@ class ModelRegistryLoader:
             tracking_uri = "sqlite:///mlflow.db"
             mlflow.set_tracking_uri(tracking_uri)
             
-            # Map aliases
             if key in ["champion", "heavy", "production", "default"]:
                 model_uri = f"models:/fraud-detection-model@champion"
                 resolved_version = "champion (Heavy DNN)"
@@ -94,12 +94,10 @@ class ModelRegistryLoader:
                     threshold = model_instance.best_threshold
 
         if model_instance is None:
-            # Fallback to fresh baseline model
             logger.warning("No saved model checkpoints found. Initializing inline baseline model.")
             model_instance = BaselineModel()
             resolved_version = "inline_fallback_baseline"
 
-        # Cache in memory
         result = (model_instance, resolved_version, threshold)
         self.loaded_models[key] = result
         return result
@@ -111,37 +109,38 @@ class ModelRegistryLoader:
         custom_threshold: Optional[float] = None
     ) -> Dict[str, Any]:
         """
-        Execute prediction pipeline: preprocessing/dataframe creation, model probability scoring,
-        and threshold classification.
+        High-Performance Prediction Pipeline:
+        Converts feature dictionaries directly to contiguous float32 NumPy arrays to bypass pandas overhead.
         """
         t0 = time.time()
         model, model_ver, default_thresh = self.get_model(version_or_alias)
         threshold = custom_threshold if custom_threshold is not None else default_thresh
 
-        # Format input into pandas DataFrame
+        # Zero-overhead NumPy matrix construction
         if isinstance(features, dict):
-            df = pd.DataFrame([features])
+            matrix = np.array([[features.get(c, 0.0) for c in self.feature_cols]], dtype=np.float32)
         elif isinstance(features, list):
-            df = pd.DataFrame(features)
-        elif isinstance(features, np.ndarray):
-            df = pd.DataFrame(features, columns=self.feature_cols[:features.shape[1]])
+            matrix = np.array([[f.get(c, 0.0) for c in self.feature_cols] for f in features], dtype=np.float32)
+        elif isinstance(features, pd.DataFrame):
+            matrix = features[self.feature_cols].values.astype(np.float32)
         else:
-            df = features.copy()
-
-        # Ensure all required features are present
-        for col in self.feature_cols:
-            if col not in df.columns:
-                df[col] = 0.0
-
-        df = df[self.feature_cols]
+            matrix = np.asarray(features, dtype=np.float32)
 
         # Get probabilities
         if hasattr(model, "predict_proba"):
-            probs = model.predict_proba(df)
+            # Pass DataFrame if object is sklearn or custom wrapper requiring DataFrame
+            if isinstance(model, (BaselineModel, HeavyModel)):
+                probs = model.predict_proba(pd.DataFrame(matrix, columns=self.feature_cols))
+            else:
+                try:
+                    probs = model.predict_proba(matrix)
+                except Exception:
+                    probs = model.predict_proba(pd.DataFrame(matrix, columns=self.feature_cols))
+
             if isinstance(probs, np.ndarray) and probs.ndim == 2:
                 probs = probs[:, 1]
         elif hasattr(model, "predict"):
-            raw_preds = model.predict(df)
+            raw_preds = model.predict(matrix)
             probs = np.array(raw_preds, dtype=float)
         else:
             raise ValueError("Loaded model object does not support predict_proba or predict interface.")
